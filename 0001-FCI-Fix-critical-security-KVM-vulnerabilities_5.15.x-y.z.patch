@@ -1,0 +1,324 @@
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index e4813964bfa0..4ec80a7f36de 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -184,11 +184,11 @@ struct kvm_shadow_walk_iterator {
+ static struct kmem_cache *pte_list_desc_cache;
+ struct kmem_cache *mmu_page_header_cache;
+ static struct percpu_counter kvm_total_used_mmu_pages;
+-
++static void kvm_mmu_zap_child_spte_if_mismatch(struct kvm_vcpu *vcpu, u64 *sptep, const gfn_t *table_gfn, const unsigned int *pt_access, gfn_t gfn, unsigned int parent_level, int direct, unsigned int access);
+ static void mmu_spte_set(u64 *sptep, u64 spte);
+ static union kvm_mmu_page_role
+ kvm_mmu_calc_root_page_role(struct kvm_vcpu *vcpu);
+-
++static noinline bool is_page_fault_root_stale(struct kvm_vcpu *vcpu);
+ struct kvm_mmu_role_regs {
+ 	const unsigned long cr0;
+ 	const unsigned long cr4;
+@@ -3009,7 +3009,7 @@ static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
+ 		if (it.level == level)
+ 			break;
+ 
+-		drop_large_spte(vcpu, it.sptep);
++		drop_large_spte(vcpu, it.sptep); kvm_mmu_zap_child_spte_if_mismatch(vcpu, it.sptep, NULL, NULL, base_gfn, it.level, true, ACC_ALL);
+ 		if (is_shadow_present_pte(*it.sptep))
+ 			continue;
+ 
+@@ -4017,7 +4017,7 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
+ 				    pfn, prefault);
+ 	} else {
+ 		r = make_mmu_pages_available(vcpu);
+-		if (r)
++		if (r || is_page_fault_root_stale(vcpu))
+ 			goto out_unlock;
+ 		r = __direct_map(vcpu, gpa, error_code, map_writable, max_level, pfn,
+ 				 prefault, is_tdp);
+@@ -6323,3 +6323,57 @@ void kvm_mmu_pre_destroy_vm(struct kvm *kvm)
+ 	if (kvm->arch.nx_lpage_recovery_thread)
+ 		kthread_stop(kvm->arch.nx_lpage_recovery_thread);
+ }
++
++static noinline void kvm_mmu_zap_child_spte_if_mismatch(struct kvm_vcpu *vcpu,
++									 u64 *sptep, const gfn_t *table_gfn,
++									 const unsigned int *pt_access, gfn_t gfn,
++									 unsigned int parent_level,
++									 int direct, unsigned int access)
++{
++	union kvm_mmu_page_role role;
++	struct kvm_mmu_page *parent_sp;
++	struct kvm_mmu_page *child;
++	bool has_4_byte_gpte;
++	unsigned int index;
++	LIST_HEAD(invalid_list);
++
++	if (!is_shadow_present_pte(*sptep) || is_large_pte(*sptep))
++		return;
++
++	if (!direct && table_gfn) {
++		index = parent_level - 2;
++		gfn = table_gfn[index];
++		access = pt_access[index];
++	}
++
++	parent_sp = sptep_to_sp(sptep);
++	child = to_shadow_page(*sptep & PT64_BASE_ADDR_MASK);
++
++	has_4_byte_gpte = !parent_sp->role.gpte_is_8_bytes;
++	role = parent_sp->role;
++	role.level = parent_level - 1;
++	role.direct = direct;
++	if (role.direct)
++		role.gpte_is_8_bytes = true;
++	role.access = access;
++	if (has_4_byte_gpte && role.level == PG_LEVEL_4K)
++		role.quadrant = ((unsigned long)(sptep - parent_sp->spt)) & 1;
++
++	if (child && child->gfn == gfn && child->role.word == role.word)
++		return;
++
++	mmu_page_zap_pte(vcpu->kvm, parent_sp, sptep, &invalid_list);
++	kvm_mmu_remote_flush_or_zap(vcpu->kvm, &invalid_list, true);
++}
++
++static noinline bool is_page_fault_root_stale(struct kvm_vcpu *vcpu)
++{
++	struct kvm_mmu_page *sp;
++
++	sp = to_shadow_page(vcpu->arch.mmu->root_hpa);
++	if (sp)
++		return sp->role.invalid ||
++		       unlikely(sp->mmu_valid_gen != vcpu->kvm->arch.mmu_valid_gen);
++
++	return kvm_test_request(KVM_REQ_MMU_RELOAD, vcpu);
++}
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index a1811f51eda9..2f5289bb723b 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -698,7 +698,7 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gpa_t addr,
+ 		gfn_t table_gfn;
+ 
+ 		clear_sp_write_flooding_count(it.sptep);
+-		drop_large_spte(vcpu, it.sptep);
++		drop_large_spte(vcpu, it.sptep); kvm_mmu_zap_child_spte_if_mismatch(vcpu, it.sptep, gw->table_gfn, gw->pt_access, 0, it.level, false, 0);
+ 
+ 		sp = NULL;
+ 		if (!is_shadow_present_pte(*it.sptep)) {
+@@ -760,7 +760,7 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gpa_t addr,
+ 
+ 		validate_direct_spte(vcpu, it.sptep, direct_access);
+ 
+-		drop_large_spte(vcpu, it.sptep);
++		drop_large_spte(vcpu, it.sptep); kvm_mmu_zap_child_spte_if_mismatch(vcpu, it.sptep, NULL, NULL, base_gfn, it.level, true, direct_access);
+ 
+ 		if (!is_shadow_present_pte(*it.sptep)) {
+ 			sp = kvm_mmu_get_page(vcpu, base_gfn, addr,
+@@ -930,7 +930,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gpa_t addr, u32 error_code,
+ 
+ 	kvm_mmu_audit(vcpu, AUDIT_PRE_PAGE_FAULT);
+ 	r = make_mmu_pages_available(vcpu);
+-	if (r)
++	if (r || is_page_fault_root_stale(vcpu))
+ 		goto out_unlock;
+ 	r = FNAME(fetch)(vcpu, addr, &walker, error_code, max_level, pfn,
+ 			 map_writable, prefault);
+diff --git a/net/bridge/netfilter/nf_conntrack_bridge.c b/net/bridge/netfilter/nf_conntrack_bridge.c
+index c63ad63db25e..861129784107 100644
+--- a/net/bridge/netfilter/nf_conntrack_bridge.c
++++ b/net/bridge/netfilter/nf_conntrack_bridge.c
+@@ -20,7 +20,7 @@
+ #include <net/netfilter/nf_tables.h>
+ 
+ #include "../br_private.h"
+-
++static int nf_br_ip_checksum_help(struct sk_buff *skb);
+ /* Best effort variant of ip_do_fragment which preserves geometry, unless skbuff
+  * has been linearized or cloned.
+  */
+@@ -40,7 +40,7 @@ static int nf_br_ip_fragment(struct net *net, struct sock *sk,
+ 
+ 	/* for offloaded checksums cleanup checksum before fragmentation */
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
+-	    (err = skb_checksum_help(skb)))
++	    (err = nf_br_ip_checksum_help(skb)))
+ 		goto blackhole;
+ 
+ 	iph = ip_hdr(skb);
+@@ -481,3 +481,12 @@ module_exit(nf_conntrack_l3proto_bridge_fini);
+ 
+ MODULE_ALIAS("nf_conntrack-" __stringify(AF_BRIDGE));
+ MODULE_LICENSE("GPL");
++
++/* Keep new checksum validation after the original code for livepatching. */
++static noinline int nf_br_ip_checksum_help(struct sk_buff *skb)
++{
++	if (unlikely(skb->csum_start < skb->network_header + ip_hdrlen(skb)))
++		return -EINVAL;
++
++	return skb_checksum_help(skb);
++}
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 5d8f8a5901bc..b4f554331039 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -82,7 +82,7 @@
+ #include <linux/netfilter_bridge.h>
+ #include <linux/netlink.h>
+ #include <linux/tcp.h>
+-
++static int ip_fragment_checksum_help(struct sk_buff *skb);
+ static int
+ ip_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ 	    unsigned int mtu,
+@@ -777,7 +777,7 @@ int ip_do_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ 
+ 	/* for offloaded checksums cleanup checksum before fragmentation */
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
+-	    (err = skb_checksum_help(skb)))
++	    (err = ip_fragment_checksum_help(skb)))
+ 		goto fail;
+ 
+ 	/*
+@@ -1762,3 +1762,12 @@ void __init ip_init(void)
+ 	igmp_mc_init();
+ #endif
+ }
++
++/* Keep new checksum validation after the original code for livepatching. */
++static noinline int ip_fragment_checksum_help(struct sk_buff *skb)
++{
++	if (unlikely(skb->csum_start < skb->network_header + ip_hdrlen(skb)))
++		return -EINVAL;
++
++	return skb_checksum_help(skb);
++}
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+index 246e3e3825e1..277671ad2bf4 100644
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -33,7 +33,7 @@
+ #include <net/tcp_states.h>
+ #include <net/netfilter/nf_queue.h>
+ #include <net/netns/generic.h>
+-
++#include <net/ip.h>
+ #include <linux/atomic.h>
+ 
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+@@ -43,7 +43,7 @@
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ #include <net/netfilter/nf_conntrack.h>
+ #endif
+-
++static int nfqnl_checksum_help(struct sk_buff *skb);
+ #define NFQNL_QMAX_DEFAULT 1024
+ 
+ /* We're using struct nlattr which has 16bit nla_len. Note that nla_len
+@@ -437,7 +437,7 @@ nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
+ 	case NFQNL_COPY_PACKET:
+ 		if (!(queue->flags & NFQA_CFG_F_GSO) &&
+ 		    entskb->ip_summed == CHECKSUM_PARTIAL &&
+-		    skb_checksum_help(entskb))
++		    nfqnl_checksum_help(entskb))
+ 			return NULL;
+ 
+ 		data_len = READ_ONCE(queue->copy_range);
+@@ -1651,3 +1651,16 @@ MODULE_ALIAS_NFNL_SUBSYS(NFNL_SUBSYS_QUEUE);
+ 
+ module_init(nfnetlink_queue_init);
+ module_exit(nfnetlink_queue_fini);
++
++/* Keep new checksum validation after the original code for livepatching. */
++static noinline int nfqnl_checksum_help(struct sk_buff *skb)
++{
++	if (skb->protocol == htons(ETH_P_IP)) {
++		if (!pskb_network_may_pull(skb, sizeof(struct iphdr)))
++			return -EINVAL;
++		if (unlikely(skb->csum_start < skb->network_header + ip_hdrlen(skb)))
++			return -EINVAL;
++	}
++
++	return skb_checksum_help(skb);
++}
+diff --git a/net/netfilter/xt_CHECKSUM.c b/net/netfilter/xt_CHECKSUM.c
+index 9d99f5a3d176..dc29aec53d5c 100644
+--- a/net/netfilter/xt_CHECKSUM.c
++++ b/net/netfilter/xt_CHECKSUM.c
+@@ -9,13 +9,13 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ #include <linux/module.h>
+ #include <linux/skbuff.h>
+-
++#include <net/ip.h>
+ #include <linux/netfilter/x_tables.h>
+ #include <linux/netfilter/xt_CHECKSUM.h>
+ 
+ #include <linux/netfilter_ipv4/ip_tables.h>
+ #include <linux/netfilter_ipv6/ip6_tables.h>
+-
++static unsigned int checksum_tg_fill(struct sk_buff *skb, const struct xt_action_param *par);
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Michael S. Tsirkin <mst@redhat.com>");
+ MODULE_DESCRIPTION("Xtables: checksum modification");
+@@ -26,7 +26,7 @@ static unsigned int
+ checksum_tg(struct sk_buff *skb, const struct xt_action_param *par)
+ {
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL && !skb_is_gso(skb))
+-		skb_checksum_help(skb);
++		return checksum_tg_fill(skb, par);
+ 
+ 	return XT_CONTINUE;
+ }
+@@ -98,3 +98,15 @@ static void __exit checksum_tg_exit(void)
+ 
+ module_init(checksum_tg_init);
+ module_exit(checksum_tg_exit);
++
++/* Keep new checksum validation after the original code for livepatching. */
++static noinline unsigned int
++checksum_tg_fill(struct sk_buff *skb, const struct xt_action_param *par)
++{
++	if (xt_family(par) == NFPROTO_IPV4 &&
++	    unlikely(skb->csum_start < skb->network_header + ip_hdrlen(skb)))
++		return NF_DROP;
++
++	skb_checksum_help(skb);
++	return XT_CONTINUE;
++}
+diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
+index 3e27daceebfe..ba2b5e226151 100644
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -26,7 +26,7 @@
+ 
+ static int xfrm_output2(struct net *net, struct sock *sk, struct sk_buff *skb);
+ static int xfrm_inner_extract_output(struct xfrm_state *x, struct sk_buff *skb);
+-
++static int xfrm_output_checksum_help(struct sk_buff *skb);
+ static int xfrm_skb_check_space(struct sk_buff *skb)
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+@@ -752,7 +752,7 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+ 	}
+ 
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+-		err = skb_checksum_help(skb);
++		err = xfrm_output_checksum_help(skb);
+ 		if (err) {
+ 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+ 			kfree_skb(skb);
+@@ -907,3 +907,13 @@ void xfrm_local_error(struct sk_buff *skb, int mtu)
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(xfrm_local_error);
++
++/* Keep new checksum validation after the original code for livepatching. */
++static noinline int xfrm_output_checksum_help(struct sk_buff *skb)
++{
++	if (skb->protocol == htons(ETH_P_IP) &&
++	    unlikely(skb->csum_start < skb->network_header + ip_hdrlen(skb)))
++		return -EINVAL;
++
++	return skb_checksum_help(skb);
++}
