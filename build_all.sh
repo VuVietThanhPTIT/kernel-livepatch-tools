@@ -147,17 +147,18 @@ for VER in "${VERSIONS[@]}"; do
     fi
 
     # =========================================================================
-    # LUON XOA CAC FILE BUILD TRUNG GIAN (CACHE, TMP OBJECT) DE KHONG TRAN DIA
-    # (Giu lai config, vmlinux, source tree goc va log file)
+    # DỌN DẸP DÙ ĐÃ BUILD XONG HAY BUILD DỞ / LỖI
     # =========================================================================
     rm -rf "$CACHEDIR"
-    rm -rf /root/.kpatch 2>/dev/null || true
-    rm -rf /tmp/kpatch* 2>/dev/null || true
-    git -C "$SRCDIR" reset --hard >/dev/null 2>&1
-    git -C "$SRCDIR" checkout -f >/dev/null 2>&1
-    git -C "$SRCDIR" clean -fdx >/dev/null 2>&1
+    rm -rf /root/.kpatch /tmp/kpatch* 2>/dev/null || true
+    if [ -d "$SRCDIR" ]; then
+        git -C "$SRCDIR" reset --hard -q >/dev/null 2>&1
+        git -C "$SRCDIR" checkout -f -q >/dev/null 2>&1
+        git -C "$SRCDIR" clean -fdxq -e .clone_ok >/dev/null 2>&1
+        make -C "$SRCDIR" -s mrproper >/dev/null 2>&1 || true
+    fi
 
-    AVAIL_AFTER=$(df -BG --output=avail "$W" 2>/dev/null | tail -n1 | tr -d ' ')
+    AVAIL_AFTER=$(df -h "$W" 2>/dev/null | tail -n1 | awk '{print $4}')
     echo "  [*] Intermediate build artifacts cleared. Disk free: $AVAIL_AFTER"
 done
 
@@ -174,3 +175,9 @@ echo ""
 echo " SKIPPED (${#SKIPPED_LIST[@]}):"
 for sk in "${SKIPPED_LIST[@]}"; do echo "   - $sk"; done
 echo "================================================================================"
+
+rm -rf /root/.kpatch /tmp/kpatch* 2>/dev/null || true
+echo ""
+echo "Disk status:"
+df -h "$W"
+
