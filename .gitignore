@@ -1,0 +1,7 @@
+*.orig
+*.bak
+*~
+*.log
+.kpatch*
+tmp/
+*.ko
