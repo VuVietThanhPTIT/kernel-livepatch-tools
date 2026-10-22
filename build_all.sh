@@ -90,10 +90,6 @@ for VER in "${VERSIONS[@]}"; do
     sed -i 's/^CONFIG_SYSTEM_TRUSTED_KEYS=.*/CONFIG_SYSTEM_TRUSTED_KEYS=""/' "$CFG"
     sed -i 's/^CONFIG_MODULE_SIG_KEY=.*/CONFIG_MODULE_SIG_KEY=""/' "$CFG"
 
-    # Bat CONFIG_DEBUG_SECTION_MISMATCH=y truc tiep trong file config
-    sed -i 's/^CONFIG_DEBUG_SECTION_MISMATCH=.*/CONFIG_DEBUG_SECTION_MISMATCH=y/' "$CFG"
-    grep -q '^CONFIG_DEBUG_SECTION_MISMATCH=y' "$CFG" || echo 'CONFIG_DEBUG_SECTION_MISMATCH=y' >> "$CFG"
-
     # Kiem tra patch apply duoc len source
     if ! git -C "$SRCDIR" apply --check "$PATCH_FILE" >/dev/null 2>&1; then
         echo "  [SKIP] Patch cannot be applied cleanly to $VER!"
@@ -111,9 +107,8 @@ for VER in "${VERSIONS[@]}"; do
     rm -f "$OUTPUT_KO"
     START_TIME=$(date +%s)
 
-    # Thiet lap co MAKEFLAGS va KCFLAGS chong lech ham inline
-    export MAKEFLAGS="${MAKEFLAGS:+$MAKEFLAGS }CONFIG_DEBUG_SECTION_MISMATCH=y"
-    export KCFLAGS="-fno-inline-functions-called-once -fno-ipa-sra -fno-ipa-cp-clone -fno-partial-inlining"
+    # Giong script mau: comment KCFLAGS, truyen MAKEFLAGS truc tiep cho kpatch-build
+    #export KCFLAGS="-fno-ipa-sra -fno-ipa-cp-clone -fno-partial-inlining -fno-inline-functions-called-once -fno-reorder-blocks-and-partition"
 
     KPATCH_ARGS=(
         -a "$TARGET_RELEASE"
@@ -124,11 +119,14 @@ for VER in "${VERSIONS[@]}"; do
         -n "$KPATCH_NAME"
         -o "$OUTPUT_DIR"
         --skip-compiler-check
+        --debug
         "$PATCH_FILE"
     )
 
     BUILD_OK=0
-    if CACHEDIR="$CACHEDIR" kpatch-build "${KPATCH_ARGS[@]}" > "$BUILD_LOG" 2>&1; then
+    if MAKEFLAGS="${MAKEFLAGS:+$MAKEFLAGS }CONFIG_DEBUG_SECTION_MISMATCH=y" \
+       CACHEDIR="$CACHEDIR" \
+       kpatch-build "${KPATCH_ARGS[@]}" > "$BUILD_LOG" 2>&1; then
         [ -s "$OUTPUT_KO" ] && BUILD_OK=1
     fi
 
